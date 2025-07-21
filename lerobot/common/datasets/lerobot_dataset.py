@@ -334,6 +334,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         download_videos: bool = True,
         local_files_only: bool = False,
         video_backend: str | None = None,
+        load_data: bool = True,
     ):
         """
         2 modes are available for instantiating this class, depending on 2 different use cases:
@@ -455,19 +456,22 @@ class LeRobotDataset(torch.utils.data.Dataset):
         # Check version
         check_version_compatibility(self.repo_id, self.meta._version, CODEBASE_VERSION)
 
-        # Load actual data
-        self.download_episodes(download_videos)
-        self.hf_dataset = self.load_hf_dataset()
-        self.episode_data_index = get_episode_data_index(self.meta.episodes, self.episodes)
+        if load_data:
+            # Load actual data
+            self.download_episodes(download_videos)
+            self.hf_dataset = self.load_hf_dataset()
+            self.episode_data_index = get_episode_data_index(self.meta.episodes, self.episodes)
 
-        # Check timestamps
-        check_timestamps_sync(self.hf_dataset, self.episode_data_index, self.fps, self.tolerance_s)
+            # Check timestamps
+            check_timestamps_sync(self.hf_dataset, self.episode_data_index, self.fps, self.tolerance_s)
 
-        # Setup delta_indices
-        if self.delta_timestamps is not None:
-            check_delta_timestamps(self.delta_timestamps, self.fps, self.tolerance_s)
-            self.delta_indices = get_delta_indices(self.delta_timestamps, self.fps)
-
+            # Setup delta_indices
+            if self.delta_timestamps is not None:
+                check_delta_timestamps(self.delta_timestamps, self.fps, self.tolerance_s)
+                self.delta_indices = get_delta_indices(self.delta_timestamps, self.fps)
+        else:
+            self.hf_dataset = None
+            self.episode_data_index = None
         # Available stats implies all videos have been encoded and dataset is iterable
         self.consolidated = self.meta.stats is not None
 
@@ -806,6 +810,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         self.consolidated = False
 
+
     def _save_episode_table(self, episode_buffer: dict, episode_index: int) -> None:
         episode_dict = {key: episode_buffer[key] for key in self.hf_features}
         ep_dataset = datasets.Dataset.from_dict(episode_dict, features=self.hf_features, split="train")
@@ -879,6 +884,65 @@ class LeRobotDataset(torch.utils.data.Dataset):
             encode_video_frames(img_dir, video_path, self.fps, overwrite=True)
 
         return video_paths
+
+    def commit_episodes_metadata(self, episodes_metadata: list[dict]) -> None:
+        """
+        Updates the global metadata files (info.json, episodes.jsonl, tasks.jsonl) with the metadata
+        from multiple saved episodes. This method is intended to be called once after all episodes have
+        been written to disk using `save_episode_data` in a distributed manner.
+
+        Args:
+            episodes_metadata (list[dict]): A list of metadata dictionaries, where each dictionary is the
+                                           output of a `save_episode_data` call.
+        """
+        if not episodes_metadata:
+            return
+
+        # Sort by episode index to ensure correct order for appending
+        episodes_metadata.sort(key=lambda x: x["episode_index"])
+
+        num_new_tasks = 0
+        for episode_meta in episodes_metadata:
+            episode_index = episode_meta["episode_index"]
+            episode_length = episode_meta["length"]
+            task = episode_meta["task"]
+            task_index = episode_meta["task_index"]
+
+            if task_index not in self.meta.tasks:
+                num_new_tasks += 1
+                self.meta.tasks[task_index] = task
+                task_dict = {
+                    "task_index": task_index,
+                    "task": task,
+                }
+                append_jsonlines(task_dict, self.meta.root / TASKS_PATH)
+
+            episode_dict = {
+                "episode_index": episode_index,
+                "tasks": [task],
+                "length": episode_length,
+            }
+            self.meta.episodes.append(episode_dict)
+            append_jsonlines(episode_dict, self.meta.root / EPISODES_PATH)
+
+        # Update info.json with aggregated metadata
+        self.meta.info["total_episodes"] += len(episodes_metadata)
+        self.meta.info["total_frames"] += sum(e["length"] for e in episodes_metadata)
+        self.meta.info["total_tasks"] += num_new_tasks
+        self.meta.info["total_videos"] += len(self.meta.video_keys) * len(episodes_metadata)
+
+        # Update info.json once at the end
+        if self.meta.info["total_episodes"] > 0:
+            # Find the max episode index from both existing and new episodes
+            max_episode_index = max(ep["episode_index"] for ep in self.meta.episodes)
+            self.meta.info["total_chunks"] = (max_episode_index // self.meta.chunks_size) + 1
+        else:
+            self.meta.info["total_chunks"] = 0
+
+        self.meta.info["splits"] = {"train": f"0:{self.meta.info['total_episodes']}"}
+        write_json(self.meta.info, self.meta.root / INFO_PATH)
+
+        self.consolidated = False
 
     def consolidate(self, run_compute_stats: bool = True, keep_image_files: bool = False) -> None:
         self.hf_dataset = self.load_hf_dataset()
@@ -1148,3 +1212,105 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
             f"  Transformations: {self.image_transforms},\n"
             f")"
         )
+
+
+class LeRobotEpisodeDataset(LeRobotDataset):
+    """
+    A LeRobotDataset that contains only one episode.
+    It's a wrapper around LeRobotDataset, initialized with a single episode index.
+    """
+
+    def __init__(
+        self,
+        task_info: dict,
+        episode_index: int,
+        start_index: int,
+        end_index: int,
+        **dataset_kwargs,
+    ):
+        super().__init__(**dataset_kwargs, load_data=False)
+        self._task_info = task_info
+        self._episode_index = episode_index
+        self._start_index = start_index
+        self._end_index = end_index
+
+
+    def create_episode_buffer(self, episode_index: int | None = None) -> dict:
+        return super().create_episode_buffer(episode_index=self._episode_index)
+
+    def save_episode_data(self, task: str, encode_videos: bool = True, episode_data: dict | None = None) -> dict:
+        """
+        This will save to disk the current episode in self.episode_buffer. Note that since it affects files on
+        disk, it sets self.consolidated to False to ensure proper consolidation later on before uploading to
+        the hub.
+
+        Use 'encode_videos' if you want to encode videos during the saving of this episode. Otherwise,
+        you can do it later with dataset.consolidate(). This is to give more flexibility on when to spend
+        time for video encoding.
+        """
+        if not episode_data:
+            episode_buffer = self.episode_buffer
+
+        episode_length = episode_buffer.pop("size")
+        episode_index = episode_buffer["episode_index"]
+        if episode_index != self._episode_index:
+            # TODO(aliberts): Add option to use existing episode_index
+            raise NotImplementedError(
+                "You might have manually provided the episode_buffer with an episode_index that doesn't "
+                "match the episode_index of this LeRobotEpisodeDataset. This is not supported for now."
+            )
+
+        if episode_length == 0:
+            raise ValueError(
+                "You must add one or several frames with `add_frame` before calling `add_episode`."
+            )
+
+        if (self._end_index - self._start_index + 1) != episode_length:
+            raise ValueError(
+                "The episode length must match the difference between start_index and end_index."
+            )
+
+        task_index = self._task_info[task]
+
+        if not set(episode_buffer.keys()) == set(self.features):
+            raise ValueError()
+
+        for key, ft in self.features.items():
+            if key == "index":
+                episode_buffer[key] = np.arange(
+                    self._start_index, self._start_index + episode_length
+                )
+            elif key == "episode_index":
+                episode_buffer[key] = np.full((episode_length,), episode_index)
+            elif key == "task_index":
+                episode_buffer[key] = np.full((episode_length,), task_index)
+            elif ft["dtype"] in ["image", "video"]:
+                continue
+            elif len(ft["shape"]) == 1 and ft["shape"][0] == 1:
+                episode_buffer[key] = np.array(episode_buffer[key], dtype=ft["dtype"])
+            elif len(ft["shape"]) == 1 and ft["shape"][0] > 1:
+                episode_buffer[key] = np.stack(episode_buffer[key])
+            else:
+                raise ValueError(key)
+
+        self._wait_image_writer()
+        self._save_episode_table(episode_buffer, episode_index)
+
+        if encode_videos and len(self.meta.video_keys) > 0:
+            video_paths = self.encode_episode_videos(episode_index)
+            for key in self.meta.video_keys:
+                episode_buffer[key] = video_paths[key]
+
+        if not episode_data:  # Reset the buffer
+            self.episode_buffer = self.create_episode_buffer()
+
+        self.consolidated = False
+
+        # Return metadata for this episode
+        episode_meta = {
+            "episode_index": episode_index,
+            "task": task,
+            "task_index": task_index,
+            "length": episode_length,
+        }
+        return episode_meta

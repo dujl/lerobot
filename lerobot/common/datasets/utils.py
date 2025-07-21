@@ -169,11 +169,15 @@ def load_stats(local_dir: Path) -> dict:
 
 
 def load_tasks(local_dir: Path) -> dict:
+    if not (local_dir / TASKS_PATH).exists():
+        return {}
     tasks = load_jsonlines(local_dir / TASKS_PATH)
     return {item["task_index"]: item["task"] for item in sorted(tasks, key=lambda x: x["task_index"])}
 
 
 def load_episodes(local_dir: Path) -> dict:
+    if not (local_dir / EPISODES_PATH).exists():
+        return []
     return load_jsonlines(local_dir / EPISODES_PATH)
 
 
