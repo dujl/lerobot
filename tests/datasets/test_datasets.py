@@ -1650,3 +1650,323 @@ def test_delta_timestamps_query_returns_correct_values(tmp_path, empty_lerobot_d
     # Previous frame is outside episode, so it's clamped to first frame and marked as padded
     assert state_values == [10.0, 10.0], f"Expected [10.0, 10.0], got {state_values}"
     assert is_pad == [True, False], f"Expected [True, False], got {is_pad}"
+
+
+def test_parallel_write_multiple_episodes_advanced(tmp_path):
+    """
+    Advanced test for distributed parallel writing with multiple episodes per worker.
+
+    This test verifies:
+    1. Multiple workers can write multiple episodes each
+    2. Episodes from different workers are correctly interleaved
+    3. Data integrity is maintained across all episodes
+    4. Global metadata is correctly consolidated
+    5. The final dataset can be loaded and used normally
+    """
+    import numpy as np
+
+    root = tmp_path / "parallel_multi_advanced"
+
+    features = {
+        "observation.state": {
+            "dtype": "float32",
+            "shape": (8,),
+            "names": None,
+        },
+        "action": {
+            "dtype": "float32",
+            "shape": (4,),
+            "names": None,
+        },
+        "reward": {
+            "dtype": "float32",
+            "shape": (1,),
+            "names": None,
+        },
+        "observation.images.cam": {
+            "dtype": "video",
+            "shape": (64, 64, 3),
+            "names": None,
+        },
+    }
+
+    # Create main dataset with videos
+    main_dataset = LeRobotDataset.create(
+        repo_id="test_parallel_advanced",
+        fps=30,
+        features=features,
+        root=root,
+        use_videos=True,
+    )
+    print("✓ 主数据集创建成功")
+
+    # Worker 1: handles episodes 0 and 2
+    worker1 = LeRobotDataset(repo_id="test_parallel_advanced", root=root, episodes=[0, 2], load_data=False)
+
+    # Worker 2: handles episodes 1 and 3
+    worker2 = LeRobotDataset(repo_id="test_parallel_advanced", root=root, episodes=[1, 3], load_data=False)
+    print("✓ Worker 数据集创建成功")
+
+    # Define episode configurations
+    episode_configs = [
+        {"idx": 0, "worker": 1, "num_frames": 5, "state_base": 0.0, "action_base": 10.0},
+        {"idx": 1, "worker": 2, "num_frames": 6, "state_base": 100.0, "action_base": 110.0},
+        {"idx": 2, "worker": 1, "num_frames": 7, "state_base": 200.0, "action_base": 210.0},
+        {"idx": 3, "worker": 2, "num_frames": 8, "state_base": 300.0, "action_base": 310.0},
+    ]
+
+    # Worker 1 writes episodes 0 and 2
+    episode_metas_worker1 = []
+    cumulative_frames = 0
+
+    for config in episode_configs:
+        if config["worker"] != 1:
+            continue
+
+        ep_idx = config["idx"]
+        num_frames = config["num_frames"]
+
+        # Generate frames for this episode
+        for frame_idx in range(num_frames):
+            state_val = config["state_base"] + frame_idx
+            action_val = config["action_base"] + frame_idx
+            reward_val = float(ep_idx * 10 + frame_idx)
+
+            frame = {
+                "observation.state": np.full(8, state_val, dtype=np.float32),
+                "action": np.full(4, action_val, dtype=np.float32),
+                "reward": np.array([reward_val], dtype=np.float32),
+            }
+            worker1.add_frame(frame, task=f"task_{ep_idx}")
+
+        # Save episode data
+        meta = worker1.save_episode_data_and_video(
+            chunk_index=0,
+            file_index=ep_idx,
+            episode_index=ep_idx,
+            task_index=ep_idx,
+            global_frame_index=cumulative_frames,
+            encode_videos=False,
+        )
+        episode_metas_worker1.append(meta)
+        cumulative_frames += num_frames
+        print(f"✓ Worker 1: Episode {ep_idx} 写入完成 ({num_frames} frames, start={meta['episode_index']})")
+
+    # Worker 2 writes episodes 1 and 3
+    episode_metas_worker2 = []
+
+    # Calculate starting indices for worker 2's episodes
+    # Episode 1 starts after episode 0 (5 frames)
+    # Episode 3 starts after episodes 0, 1, 2 (5+6+7 = 18 frames)
+    worker2_start_indices = {
+        1: 5,  # After episode 0
+        3: 5 + 6 + 7,  # After episodes 0, 1, 2
+    }
+
+    for config in episode_configs:
+        if config["worker"] != 2:
+            continue
+
+        ep_idx = config["idx"]
+        num_frames = config["num_frames"]
+
+        # Generate frames for this episode
+        for frame_idx in range(num_frames):
+            state_val = config["state_base"] + frame_idx
+            action_val = config["action_base"] + frame_idx
+            reward_val = float(ep_idx * 10 + frame_idx)
+
+            frame = {
+                "observation.state": np.full(8, state_val, dtype=np.float32),
+                "action": np.full(4, action_val, dtype=np.float32),
+                "reward": np.array([reward_val], dtype=np.float32),
+            }
+            worker2.add_frame(frame, task=f"task_{ep_idx}")
+
+        # Save episode data with correct global_frame_index
+        start_idx = worker2_start_indices[ep_idx]
+        meta = worker2.save_episode_data_and_video(
+            chunk_index=0,
+            file_index=ep_idx,
+            episode_index=ep_idx,
+            task_index=ep_idx,
+            global_frame_index=start_idx,
+            encode_videos=False,
+        )
+        episode_metas_worker2.append(meta)
+        print(f"✓ Worker 2: Episode {ep_idx} 写入完成 ({num_frames} frames, start={start_idx})")
+
+    # Consolidate all episodes
+    all_episode_metas = episode_metas_worker1 + episode_metas_worker2
+    all_episode_metas.sort(key=lambda x: x["episode_index"])
+    main_dataset.commit_metadata(all_episode_metas)
+    print("✓ 所有 episode 元数据合并成功")
+
+    # Verify by loading the dataset
+    loaded_dataset = LeRobotDataset(repo_id="test_parallel_advanced", root=root)
+
+    # Verify total frames (5 + 6 + 7 + 8 = 26)
+    expected_total_frames = 26
+    assert len(loaded_dataset) == expected_total_frames
+    print(f"✓ 总帧数正确: {len(loaded_dataset)}")
+
+    # Verify number of episodes
+    assert loaded_dataset.num_episodes == 4
+    print(f"✓ Episode 数量正确: {loaded_dataset.num_episodes}")
+
+    # Verify data integrity for each episode
+    cumulative = 0
+    for ep_idx in range(4):
+        frame = loaded_dataset[cumulative]
+        assert frame["episode_index"].item() == ep_idx
+
+        # Verify state pattern
+        expected_state = ep_idx * 10  # First frame in episode
+        actual_state = frame["observation.state"][0].item()
+        assert abs(actual_state - expected_state) < 0.01
+
+        print(f"✓ Episode {ep_idx} 数据验证通过 (start_idx={cumulative})")
+        cumulative += 5 + ep_idx  # 5, 6, 7, 8 frames for episodes 0,1,2,3
+
+    print()
+    print("=== 所有多 Episode 高级测试通过! ===")
+
+
+# Run the test if executed directly
+if __name__ == "__main__":
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp_path:
+        test_parallel_write_multiple_episodes_advanced(Path(tmp_path))
+
+
+def test_parallel_write_multiple_episodes(tmp_path):
+    """
+    Test distributed parallel writing with multiple episodes per worker.
+
+    This test verifies that:
+    1. Multiple workers can write multiple episodes each
+    2. Episodes from different workers are correctly interleaved
+    3. Data integrity is maintained across all episodes
+    4. Global metadata is correctly consolidated
+    """
+    root = tmp_path / "parallel_multi_test"
+
+    features = {
+        "observation.state": {
+            "dtype": "float32",
+            "shape": (4,),
+            "names": None,
+        },
+        "action": {
+            "dtype": "float32",
+            "shape": (4,),
+            "names": None,
+        },
+    }
+
+    # Create main dataset
+    main_dataset = LeRobotDataset.create(
+        repo_id="test_parallel_multi",
+        fps=30,
+        features=features,
+        root=root,
+        use_videos=False,
+    )
+    print("✓ 主数据集创建成功")
+
+    # Create two worker datasets
+    worker1 = LeRobotDataset(repo_id="test_parallel_multi", root=root, episodes=[0, 2], load_data=False)
+    worker2 = LeRobotDataset(repo_id="test_parallel_multi", root=root, episodes=[1, 3], load_data=False)
+    print("✓ Worker 数据集创建成功")
+
+    # Worker 1 writes episodes 0 and 2
+    episode_metas_worker1 = []
+    start_index = 0
+    for ep_idx in [0, 2]:
+        num_frames = 5 + ep_idx  # Episode 0: 5 frames, Episode 2: 7 frames
+        for frame_idx in range(num_frames):
+            state = np.array([ep_idx * 10 + frame_idx] * 4, dtype=np.float32)
+            action = np.array([ep_idx * 100 + frame_idx] * 4, dtype=np.float32)
+            worker1.add_frame({"observation.state": state, "action": action}, task=f"task_{ep_idx}")
+
+        meta = worker1.save_episode_data_and_video(
+            chunk_index=0,
+            file_index=ep_idx,
+            episode_index=ep_idx,
+            task_index=ep_idx,
+            global_frame_index=start_index,
+            encode_videos=False,
+        )
+        episode_metas_worker1.append(meta)
+        start_index += num_frames
+        print(f"✓ Worker 1: Episode {ep_idx} 写入完成 ({num_frames} frames)")
+
+    # Worker 2 writes episodes 1 and 3
+    episode_metas_worker2 = []
+    for ep_idx in [1, 3]:
+        num_frames = 5 + ep_idx  # Episode 1: 6 frames, Episode 3: 8 frames
+        for frame_idx in range(num_frames):
+            state = np.array([ep_idx * 10 + frame_idx] * 4, dtype=np.float32)
+            action = np.array([ep_idx * 100 + frame_idx] * 4, dtype=np.float32)
+            worker2.add_frame({"observation.state": state, "action": action}, task=f"task_{ep_idx}")
+
+        # Calculate correct start_index based on episodes before this one
+        # Episodes are written in order 0, 1, 2, 3
+        # Episode 1 starts after episode 0 (5 frames)
+        # Episode 3 starts after episodes 0, 1, 2 (5 + 6 + 7 = 18 frames)
+        if ep_idx == 1:
+            ep_start = 5  # After episode 0
+        else:  # ep_idx == 3
+            ep_start = 5 + 6 + 7  # After episodes 0, 1, 2
+
+        meta = worker2.save_episode_data_and_video(
+            chunk_index=0,
+            file_index=ep_idx,
+            episode_index=ep_idx,
+            task_index=ep_idx,
+            global_frame_index=ep_start,
+            encode_videos=False,
+        )
+        episode_metas_worker2.append(meta)
+        print(f"✓ Worker 2: Episode {ep_idx} 写入完成 ({num_frames} frames)")
+
+    # Consolidate all episodes
+    all_episode_metas = episode_metas_worker1 + episode_metas_worker2
+    all_episode_metas.sort(key=lambda x: x["episode_index"])
+    main_dataset.commit_metadata(all_episode_metas)
+    print("✓ 所有 episode 元数据合并成功")
+
+    # Verify by loading the dataset
+    loaded_dataset = LeRobotDataset(repo_id="test_parallel_multi", root=root)
+
+    # Verify total frames
+    expected_total_frames = 5 + 6 + 7 + 8  # Episodes 0,1,2,3 have 5,6,7,8 frames
+    assert len(loaded_dataset) == expected_total_frames, (
+        f"Expected {expected_total_frames} frames, got {len(loaded_dataset)}"
+    )
+    print(f"✓ 总帧数正确: {len(loaded_dataset)}")
+
+    # Verify number of episodes
+    assert loaded_dataset.num_episodes == 4, f"Expected 4 episodes, got {loaded_dataset.num_episodes}"
+    print(f"✓ Episode 数量正确: {loaded_dataset.num_episodes}")
+
+    # Verify data integrity for each episode
+    for ep_idx in range(4):
+        # Get the first frame of this episode
+        # Find the starting index for this episode
+        start_idx = sum(5 + i for i in range(ep_idx))  # Cumulative frames before this episode
+
+        frame = loaded_dataset[start_idx]
+        assert frame["episode_index"].item() == ep_idx, f"Episode index mismatch at episode {ep_idx}"
+        assert frame["frame_index"].item() == 0, f"Frame index should be 0 at start of episode {ep_idx}"
+
+        # Verify state value pattern (ep_idx * 10 + frame_idx)
+        expected_state_value = ep_idx * 10  # First frame has frame_idx = 0
+        actual_state = frame["observation.state"][0].item()
+        assert abs(actual_state - expected_state_value) < 0.01, f"State value mismatch at episode {ep_idx}"
+
+        print(f"✓ Episode {ep_idx} 数据验证通过")
+
+    print()
+    print("=== 所有多 Episode 分布式写入测试通过! ===")
